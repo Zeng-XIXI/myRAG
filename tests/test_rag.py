@@ -1,0 +1,147 @@
+"""无需 API 密钥的行为测试：模型使用替身，向量库使用真实本地 Chroma。"""
+
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+from config import Settings
+from models import Models
+from rag import COLLECTION, RAG, split_text
+
+
+class RAGTests(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        self.settings = Settings(
+            llm_base_url="https://example.invalid/v1", llm_api_key="test",
+            llm_model="chat-test", embedding_base_url="https://example.invalid/v1",
+            embedding_api_key="test", embedding_model="embedding-test",
+            docs_dir=root / "docs", db_dir=root / "storage", top_k=1,
+        )
+        self.settings.docs_dir.mkdir()
+        model_patch = patch("rag.Models", autospec=True)
+        self.models = model_patch.start().return_value
+        self.addCleanup(model_patch.stop)
+        # 人工向量只用于验证检索流程：backup 和其他内容位于不同方向。
+        self.models.embed.side_effect = lambda texts: [
+            [1.0, 0.0] if "backup" in text else [0.0, 1.0] for text in texts
+        ]
+        self.rag = RAG(self.settings)
+
+    def write_doc(self, name, text):
+        path = self.settings.docs_dir / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def collection(self):
+        return self.rag.db.get_collection(COLLECTION, embedding_function=None)
+
+    def test_rebuild_is_persistent_without_duplicates_or_deleted_files(self):
+        self.write_doc("keep.md", "保留的资料")
+        removed = self.write_doc("remove.txt", "即将删除的资料")
+        self.assertEqual(self.rag.ingest(), (2, 2))
+        self.assertEqual(self.rag.ingest(), (2, 2))
+        self.assertEqual(self.collection().count(), 2)
+
+        removed.unlink()
+        self.write_doc("new.md", "新资料")
+        self.assertEqual(self.rag.ingest(), (2, 2))
+        # 新建 RAG 实例，证明记录从同一个持久化目录读取。
+        reopened = RAG(self.settings)
+        records = reopened.db.get_collection(COLLECTION, embedding_function=None).get()
+        self.assertEqual(len(records["ids"]), 2)
+        self.assertEqual({item["source"] for item in records["metadatas"]},
+                         {"keep.md", "new.md"})
+
+    def test_embedding_failure_preserves_previous_index(self):
+        self.write_doc("notes.md", "原有资料")
+        self.rag.ingest()
+        self.write_doc("notes.md", "替换后的资料")
+        self.models.embed.side_effect = RuntimeError("模拟 API 故障")
+
+        with self.assertRaisesRegex(RuntimeError, "模拟 API 故障"):
+            self.rag.ingest()
+        self.assertEqual(self.collection().get()["documents"], ["原有资料"])
+
+    def test_switching_embedding_model_or_endpoint_requires_reindex(self):
+        self.write_doc("notes.md", "已入库资料")
+        self.rag.ingest()
+        # 替身仍然产生二维向量；模型身份变化也必须拒绝混用。
+        for change in ({"embedding_model": "another-two-dimensional-model"},
+                       {"embedding_base_url": "https://other.invalid/v1"}):
+            with self.subTest(change=change):
+                self.models.embed.reset_mock()
+                changed = RAG(replace(self.settings, **change))
+                with self.assertRaisesRegex(ValueError, "重新运行.*ingest"):
+                    changed.search("资料")
+                self.models.embed.assert_not_called()
+
+    def test_ask_keeps_original_question_and_actual_retrieval_sources(self):
+        self.write_doc("backup.md", "backup：在设置里点击导出备份。")
+        self.write_doc("sharing.md", "共享：邀请其他用户加入。")
+        self.rag.ingest()
+        original = "我想保留一份本地副本，但不要开启共享，怎么操作？"
+        self.models.chat.side_effect = ["backup", "在设置里点击导出备份。[1]"]
+
+        result = self.rag.ask(original)
+
+        self.assertEqual(result["query"], "backup")
+        self.assertEqual(result["answer"], "在设置里点击导出备份。[1]")
+        self.assertEqual(result["sources"][0]["source"], "backup.md")
+        self.assertEqual(self.models.chat.call_args_list[0].args[1], original)
+        final_prompt = self.models.chat.call_args_list[1].args[1]
+        self.assertIn(original, final_prompt)
+        self.assertIn("[1] 文件：backup.md，片段：1", final_prompt)
+        self.assertIn(result["sources"][0]["text"], final_prompt)
+        self.assertNotIn("sharing.md", final_prompt)
+
+    def test_missing_index_and_empty_questions_fail_before_api_calls(self):
+        for operation in (self.rag.search, self.rag.ask):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(ValueError, "先运行.*ingest"):
+                    operation("正常问题")
+                with self.assertRaisesRegex(ValueError, "不能为空"):
+                    operation(" \n ")
+        self.models.chat.assert_not_called()
+        self.models.embed.assert_not_called()
+
+    def test_empty_documents_preserve_previous_index(self):
+        path = self.write_doc("notes.md", "原有资料")
+        self.rag.ingest()
+        path.write_text(" \n ", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "原索引未修改"):
+            self.rag.ingest()
+        self.assertEqual(self.collection().get()["documents"], ["原有资料"])
+
+
+class TextAndModelTests(unittest.TestCase):
+    def test_chunk_boundaries_do_not_create_redundant_tail(self):
+        for text, expected in (
+            ("", []), ("abcd", ["abcd"]), ("abcde", ["abcd", "de"]),
+            ("abcdefg", ["abcd", "defg"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(split_text(text, size=4, overlap=1), expected)
+        with self.assertRaises(ValueError):
+            split_text("abc", size=4, overlap=4)
+
+    def test_embedding_response_is_reordered_by_index(self):
+        # 模拟服务商乱序返回；不创建网络连接。
+        settings = Settings("", "", "", "https://example.invalid/v1", "test", "embed")
+        with patch("models.OpenAI") as client_class:
+            client = client_class.return_value.__enter__.return_value
+            client.embeddings.create.return_value = SimpleNamespace(data=[
+                SimpleNamespace(index=1, embedding=[0.0, 1.0]),
+                SimpleNamespace(index=0, embedding=[1.0, 0.0]),
+            ])
+            self.assertEqual(Models(settings).embed(["第一段", "第二段"]),
+                             [[1.0, 0.0], [0.0, 1.0]])
+
+
+if __name__ == "__main__":
+    unittest.main()

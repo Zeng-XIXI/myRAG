@@ -1,0 +1,42 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="GitPython" />
+          <option value="Pillow" />
+          <option value="accelerate" />
+          <option value="blendmodes" />
+          <option value="clean-fid" />
+          <option value="diskcache" />
+          <option value="einops" />
+          <option value="facexlib" />
+          <option value="fastapi" />
+          <option value="gradio" />
+          <option value="inflection" />
+          <option value="jsonmerge" />
+          <option value="kornia" />
+          <option value="lark" />
+          <option value="numpy" />
+          <option value="omegaconf" />
+          <option value="open-clip-torch" />
+          <option value="piexif" />
+          <option value="protobuf" />
+          <option value="psutil" />
+          <option value="pytorch_lightning" />
+          <option value="requests" />
+          <option value="resize-right" />
+          <option value="safetensors" />
+          <option value="scikit-image" />
+          <option value="tomesd" />
+          <option value="torch" />
+          <option value="torchdiffeq" />
+          <option value="torchsde" />
+          <option value="transformers" />
+          <option value="pillow-avif-plugin" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
