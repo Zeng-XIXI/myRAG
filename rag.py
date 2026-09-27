@@ -1,4 +1,7 @@
-"""RAG 的完整流程：读取资料、切块、入库、检索、根据资料回答。"""
+"""RAG 的完整流程：读取资料、增量入库、检索、根据资料回答。"""
+
+from dataclasses import dataclass
+from hashlib import sha256
 
 import chromadb
 from chromadb.errors import NotFoundError
@@ -7,6 +10,20 @@ from config import Settings
 from models import Models
 
 COLLECTION = "knowledge"
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    """一次增量同步的统计结果。"""
+
+    added_files: int
+    modified_files: int
+    deleted_files: int
+    unchanged_files: int
+    embedded_chunks: int
+    total_files: int
+    total_chunks: int
+    rebuilt: bool = False
 
 
 def split_text(text: str, size: int, overlap: int) -> list[str]:
@@ -30,53 +47,144 @@ class RAG:
         # 数据保存在本机目录；无需另外启动数据库服务。
         self.db = chromadb.PersistentClient(path=str(settings.db_dir))
 
-    def ingest(self) -> tuple[int, int]:
-        """全量重建索引。每条记录同时保存向量、原文、文件名和块编号。"""
-        settings = self.settings
-        if not settings.docs_dir.is_dir():
-            raise ValueError(f"资料目录不存在：{settings.docs_dir}")
-        else:
-            print(f"正在读取目录{settings.docs_dir}下的资料")
-        documents, metadatas = [], []
-        file_count = 0
-        for path in sorted(settings.docs_dir.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in {".txt", ".md"}:
-                continue
-            chunks = split_text(
-                path.read_text(encoding="utf-8"), settings.chunk_size, settings.chunk_overlap
-            )
-            if chunks:
-                file_count += 1
-            for number, chunk in enumerate(chunks, 1):
-                documents.append(chunk)
-                metadatas.append({"source": path.relative_to(settings.docs_dir).as_posix(),
-                                  "chunk": number})
-        if not documents:
-            raise ValueError("没有找到非空的 UTF-8 .txt 或 .md 资料，原索引未修改。")
+    def _collection_metadata(self) -> dict:
+        """影响已有向量是否还能复用的配置。"""
+        return {
+            "embedding_model": self.settings.embedding_model,
+            "embedding_base_url": self.settings.embedding_base_url,
+            "chunk_size": self.settings.chunk_size,
+            "chunk_overlap": self.settings.chunk_overlap,
+        }
 
-        # 先完成所有 API 请求；请求失败时保留原索引。
-        vectors = self.models.embed(documents)
-        try:
-            self.db.delete_collection(COLLECTION)
-        except NotFoundError:
-            pass  # 第一次入库时，没有旧索引。
-        print(f"开始创建库表{COLLECTION}，准备入库")
-        collection = self.db.create_collection(
+    def _create_collection(self):
+        return self.db.create_collection(
             COLLECTION,
             embedding_function=None,  # 向量由我们提供，禁止隐式下载默认模型。
             configuration={"hnsw": {"space": "cosine"}},
-            metadata={"embedding_model": settings.embedding_model,
-                      "embedding_base_url": settings.embedding_base_url},
+            metadata=self._collection_metadata(),
         )
-        for start in range(0, len(documents), 100):
-            end = min(start + 100, len(documents))
+
+    @staticmethod
+    def _chunk_id(source: str, number: int) -> str:
+        """路径哈希避免文件名中的特殊字符影响记录 ID。"""
+        source_id = sha256(source.encode("utf-8")).hexdigest()
+        return f"{source_id}:{number}"
+
+    @staticmethod
+    def _add_chunks(collection, records: list[dict], vectors: list[list[float]]):
+        """分批写入，避免一次提交过多记录。"""
+        for start in range(0, len(records), 100):
+            batch = records[start:start + 100]
+            end = start + len(batch)
             collection.add(
-                ids=[str(index) for index in range(start, end)],
-                documents=documents[start:end],
+                ids=[item["id"] for item in batch],
+                documents=[item["text"] for item in batch],
                 embeddings=vectors[start:end],
-                metadatas=metadatas[start:end],
+                metadatas=[item["metadata"] for item in batch],
             )
-        return file_count, len(documents)
+
+    def ingest(self) -> IngestResult:
+        """按文件路径和内容哈希，将 docs 增量同步到 Chroma。"""
+        settings = self.settings
+        if not settings.docs_dir.is_dir():
+            raise ValueError(f"资料目录不存在：{settings.docs_dir}")
+
+        # 当前文件：source -> 文件哈希和切块结果。
+        current_files = {}
+        for path in sorted(settings.docs_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".txt", ".md"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            chunks = split_text(text, settings.chunk_size, settings.chunk_overlap)
+            if not chunks:
+                continue
+            source = path.relative_to(settings.docs_dir).as_posix()
+            current_files[source] = {
+                "hash": sha256(text.encode("utf-8")).hexdigest(),
+                "chunks": chunks,
+            }
+
+        if not current_files:
+            raise ValueError("没有找到非空的 UTF-8 .txt 或 .md 资料，原索引未修改。")
+
+        try:
+            collection = self.db.get_collection(COLLECTION, embedding_function=None)
+        except NotFoundError:
+            collection = None
+
+        # 向量模型或切块规则变化时，旧向量无法安全复用。
+        needs_rebuild = (
+            collection is not None
+            and any((collection.metadata or {}).get(key) != value
+                    for key, value in self._collection_metadata().items())
+        )
+
+        indexed_hashes: dict[str, set[str]] = {}
+        if collection is not None and not needs_rebuild:
+            stored = collection.get(include=["metadatas"])
+            for metadata in stored["metadatas"]:
+                source = metadata.get("source")
+                file_hash = metadata.get("file_hash")
+                if source:
+                    indexed_hashes.setdefault(source, set())
+                    if file_hash:
+                        indexed_hashes[source].add(file_hash)
+
+        current_sources = set(current_files)
+        indexed_sources = set(indexed_hashes)
+        if collection is None or needs_rebuild:
+            added = current_sources if collection is None else set()
+            modified = current_sources if collection is not None else set()
+            deleted = indexed_sources - current_sources
+            unchanged = set()
+            changed_sources = current_sources
+        else:
+            added = current_sources - indexed_sources
+            deleted = indexed_sources - current_sources
+            modified = {
+                source for source in current_sources & indexed_sources
+                if indexed_hashes[source] != {current_files[source]["hash"]}
+            }
+            unchanged = (current_sources & indexed_sources) - modified
+            changed_sources = added | modified
+
+        # 先生成全部新向量；API 失败时不触碰旧索引。
+        new_records = []
+        for source in sorted(changed_sources):
+            file_hash = current_files[source]["hash"]
+            for number, chunk in enumerate(current_files[source]["chunks"], 1):
+                new_records.append({
+                    "id": self._chunk_id(source, number),
+                    "text": chunk,
+                    "metadata": {
+                        "source": source,
+                        "file_hash": file_hash,
+                        "chunk": number,
+                    },
+                })
+        vectors = self.models.embed([item["text"] for item in new_records]) \
+            if new_records else []
+
+        if collection is None or needs_rebuild:
+            if collection is not None:
+                self.db.delete_collection(COLLECTION)
+            collection = self._create_collection()
+        else:
+            # 修改文件整份替换；删除文件清掉其全部片段。
+            for source in sorted(modified | deleted):
+                collection.delete(where={"source": source})
+
+        self._add_chunks(collection, new_records, vectors)
+        return IngestResult(
+            added_files=len(added),
+            modified_files=len(modified),
+            deleted_files=len(deleted),
+            unchanged_files=len(unchanged),
+            embedded_chunks=len(new_records),
+            total_files=len(current_files),
+            total_chunks=collection.count(),
+            rebuilt=needs_rebuild,
+        )
 
     def _collection(self):
         try:

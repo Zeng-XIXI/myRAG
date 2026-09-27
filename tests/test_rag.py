@@ -41,22 +41,51 @@ class RAGTests(unittest.TestCase):
     def collection(self):
         return self.rag.db.get_collection(COLLECTION, embedding_function=None)
 
-    def test_rebuild_is_persistent_without_duplicates_or_deleted_files(self):
+    def test_incremental_sync_adds_and_deletes_only_changed_files(self):
         self.write_doc("keep.md", "保留的资料")
         removed = self.write_doc("remove.txt", "即将删除的资料")
-        self.assertEqual(self.rag.ingest(), (2, 2))
-        self.assertEqual(self.rag.ingest(), (2, 2))
+        first = self.rag.ingest()
+        self.assertEqual((first.added_files, first.embedded_chunks), (2, 2))
+
+        self.models.embed.reset_mock()
+        unchanged = self.rag.ingest()
+        self.assertEqual((unchanged.unchanged_files, unchanged.embedded_chunks), (2, 0))
+        self.models.embed.assert_not_called()
         self.assertEqual(self.collection().count(), 2)
 
         removed.unlink()
         self.write_doc("new.md", "新资料")
-        self.assertEqual(self.rag.ingest(), (2, 2))
+        changed = self.rag.ingest()
+        self.assertEqual(
+            (changed.added_files, changed.deleted_files, changed.unchanged_files),
+            (1, 1, 1),
+        )
+        self.models.embed.assert_called_once_with(["新资料"])
         # 新建 RAG 实例，证明记录从同一个持久化目录读取。
         reopened = RAG(self.settings)
         records = reopened.db.get_collection(COLLECTION, embedding_function=None).get()
         self.assertEqual(len(records["ids"]), 2)
         self.assertEqual({item["source"] for item in records["metadatas"]},
                          {"keep.md", "new.md"})
+
+    def test_modified_file_replaces_all_its_chunks(self):
+        self.settings.chunk_size = 4
+        self.settings.chunk_overlap = 1
+        path = self.write_doc("notes.md", "abcdefg")
+        self.write_doc("keep.md", "保持不变")
+        self.rag.ingest()
+
+        self.models.embed.reset_mock()
+        path.write_text("XYZ", encoding="utf-8")
+        result = self.rag.ingest()
+
+        self.assertEqual((result.modified_files, result.unchanged_files), (1, 1))
+        self.models.embed.assert_called_once_with(["XYZ"])
+        records = self.collection().get(include=["documents", "metadatas"])
+        notes = [text for text, metadata in zip(
+            records["documents"], records["metadatas"]
+        ) if metadata["source"] == "notes.md"]
+        self.assertEqual(notes, ["XYZ"])
 
     def test_embedding_failure_preserves_previous_index(self):
         self.write_doc("notes.md", "原有资料")
@@ -80,6 +109,19 @@ class RAGTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "重新运行.*ingest"):
                     changed.search("资料")
                 self.models.embed.assert_not_called()
+
+    def test_chunk_setting_change_forces_full_rebuild(self):
+        self.write_doc("notes.md", "abcdefgh")
+        self.rag.ingest()
+
+        changed = RAG(replace(self.settings, chunk_size=4, chunk_overlap=1))
+        changed.models = self.models
+        self.models.embed.reset_mock()
+        result = changed.ingest()
+
+        self.assertTrue(result.rebuilt)
+        self.assertEqual(result.total_chunks, 3)
+        self.models.embed.assert_called_once_with(["abcd", "defg", "gh"])
 
     def test_ask_keeps_original_question_and_actual_retrieval_sources(self):
         self.write_doc("backup.md", "backup：在设置里点击导出备份。")

@@ -73,7 +73,10 @@ class SDKIntegrationTests(unittest.TestCase):
             )
             with patch("models.OpenAI", side_effect=client_with_mock_transport):
                 rag = RAG(settings)
-                self.assertEqual(rag.ingest(), (2, 2))
+                ingest_result = rag.ingest()
+                self.assertEqual(
+                    (ingest_result.added_files, ingest_result.total_chunks), (2, 2)
+                )
                 result = rag.ask("如何备份？")
 
         self.assertEqual([path for path, _ in requests], [
