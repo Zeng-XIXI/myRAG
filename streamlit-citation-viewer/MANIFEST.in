@@ -1,0 +1,2 @@
+recursive-include streamlit_citation_viewer/frontend/build *
+include pyproject.toml
