@@ -143,12 +143,35 @@ class RAGTests(unittest.TestCase):
         self.rag.ingest()
         original = "我想保留一份本地副本，但不要开启共享，怎么操作？"
         self.models.chat.side_effect = ["backup", "在设置里点击导出备份。[1]"]
+        events = []
 
-        result = self.rag.ask(original)
+        result = self.rag.ask(
+            original,
+            progress=events.append,
+            request_id="test1234",
+        )
 
+        self.assertEqual(result["request_id"], "test1234")
         self.assertEqual(result["query"], "backup")
         self.assertEqual(result["answer"], "在设置里点击导出备份。[1]")
         self.assertEqual(result["sources"][0]["source"], "backup.md")
+        completed_stages = [
+            event["stage"] for event in events
+            if event["state"] == "complete"
+        ]
+        self.assertEqual(completed_stages, [
+            "index_check",
+            "rewrite",
+            "embedding",
+            "vector_search",
+            "context_build",
+            "answer_generation",
+        ])
+        self.assertTrue(all(
+            result["timings"][f"{stage}_ms"] >= 0
+            for stage in completed_stages
+        ))
+        self.assertGreaterEqual(result["timings"]["rag_total_ms"], 0)
         self.assertEqual(self.models.chat.call_args_list[0].args[1], original)
         final_prompt = self.models.chat.call_args_list[1].args[1]
         self.assertIn(original, final_prompt)
@@ -163,6 +186,23 @@ class RAGTests(unittest.TestCase):
                     operation("正常问题")
                 with self.assertRaisesRegex(ValueError, "不能为空"):
                     operation(" \n ")
+        self.models.chat.assert_not_called()
+        self.models.embed.assert_not_called()
+
+    def test_failed_stage_emits_error_event(self):
+        events = []
+
+        with self.assertRaisesRegex(ValueError, "先运行.*ingest"):
+            self.rag.ask(
+                "正常问题",
+                progress=events.append,
+                request_id="failed01",
+            )
+
+        self.assertEqual(
+            [(event["stage"], event["state"]) for event in events],
+            [("index_check", "start"), ("index_check", "error")],
+        )
         self.models.chat.assert_not_called()
         self.models.embed.assert_not_called()
 

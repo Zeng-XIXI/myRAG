@@ -1,13 +1,34 @@
 """面向用户的 RAG 网页入口。"""
 
 from hashlib import sha256
+import logging
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
+
 import streamlit as st
 
 from config import load_settings
 from rag import RAG
 from streamlit_citation_viewer import streamlit_citation_viewer
+
+
+def configure_logging():
+    """配置一次应用日志，避免 Streamlit 重跑时重复添加 Handler。"""
+    app_logger = logging.getLogger("myrag")
+    if not app_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        app_logger.addHandler(handler)
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+
+
+configure_logging()
+logger = logging.getLogger("myrag.app")
 
 st.set_page_config(
     page_title="资料问答助手",
@@ -15,16 +36,99 @@ st.set_page_config(
     layout="wide",
 )
 
-"""计算时间流逝了多少"""
+##计算时间流逝了多少
 def elapsed_ms(start: float) -> float:
     return round((perf_counter() - start) * 1000, 1)
+
+
+def run_ui_stage(
+    status,
+    events: list[dict],
+    request_id: str,
+    stage: str,
+    label: str,
+    action,
+):
+    """执行一个页面阶段，同时更新状态栏、事件列表和终端日志。"""
+    start_event = {
+        "request_id": request_id,
+        "stage": stage,
+        "label": label,
+        "state": "start",
+        "duration_ms": None,
+    }
+    events.append(start_event)
+    status.update(label=f":shimmer[正在{label}……]", state="running")
+    logger.info("request=%s stage=%s state=start", request_id, stage)
+    start = perf_counter()
+
+    try:
+        result = action()
+    except Exception:
+        duration = elapsed_ms(start)
+        events.append({
+            **start_event,
+            "state": "error",
+            "duration_ms": duration,
+        })
+        status.update(label=f"{label}失败", state="error")
+        logger.exception(
+            "request=%s stage=%s state=error duration_ms=%.1f",
+            request_id, stage, duration,
+        )
+        raise
+
+    duration = elapsed_ms(start)
+    events.append({
+        **start_event,
+        "state": "complete",
+        "duration_ms": duration,
+    })
+    status.markdown(f":green[✓] {label} · {duration / 1000:.3f} 秒")
+    logger.info(
+        "request=%s stage=%s state=complete duration_ms=%.1f",
+        request_id, stage, duration,
+    )
+    return result, duration
+
+
+def make_progress_reporter(status, events: list[dict]):
+    """把 RAG 层事件转换为当前回答中的动态状态。"""
+    def report(event: dict):
+        events.append(event)
+        label = event["label"]
+        state = event["state"]
+        if state == "start":
+            status.update(label=f":shimmer[正在{label}……]", state="running")
+        elif state == "complete":
+            duration = event["duration_ms"] or 0
+            status.markdown(f":green[✓] {label} · {duration / 1000:.3f} 秒")
+        else:
+            status.update(label=f"{label}失败", state="error")
+
+    return report
+
+
+def show_progress_summary(events: list[dict], timings: dict):
+    """在页面重跑后恢复已经完成的阶段状态栏。"""
+    completed_events = [event for event in events if event.get("state") == "complete"]
+    if not completed_events:
+        return
+
+    total_ms = timings.get("total_ms", 0)
+    label = f"回答完成 · {total_ms / 1000:.2f} 秒" if total_ms else "回答完成"
+    with st.status(label, state="complete", type="compact"):
+        for event in completed_events:
+            duration_ms = event.get("duration_ms", 0)
+            st.markdown(f":green[✓] {event['label']} · {duration_ms / 1000:.3f} 秒")
+
 
 @st.cache_resource
 def get_rag() -> RAG:
     """创建并复用 RAG，避免每次页面刷新都重新连接向量库。"""
     return RAG(load_settings())
 
-"""在弹窗中预览 Markdown 或文本文件。"""
+## 在弹窗中预览 Markdown 或文本文件。
 @st.dialog("文件预览",width="large",icon=":material/preview:")
 def preview_file(path: Path, docs_dir: Path):
 
@@ -48,7 +152,7 @@ def preview_file(path: Path, docs_dir: Path):
             disabled=True,
         )
 
-"""为引用预览补充原文件，并标记文件是否仍与索引一致。"""
+## 为引用预览补充原文件，并标记文件是否仍与索引一致。
 def sources_with_file_content(sources: list[dict]) -> list[dict]:
     docs_dir = load_settings().docs_dir.resolve()
     prepared = []
@@ -76,7 +180,7 @@ def sources_with_file_content(sources: list[dict]) -> list[dict]:
 
     return prepared
 
-"""展示一次问答的阶段耗时。"""
+## 展示一次问答的阶段耗时。
 def show_timings(timings: dict):
     if not timings:
         return
@@ -90,6 +194,7 @@ def show_timings(timings: dict):
         ("Context 组装", "context_build_ms"),
         ("答案生成", "answer_generation_ms"),
         ("引用文件准备", "preview_prepare_ms"),
+        ("页面数据完成", "page_finalize_ms"),
     ]
 
     total_ms = timings.get("total_ms", 0)
@@ -136,6 +241,10 @@ with chat_column:
         with st.chat_message(message["role"]):
             sources = message.get("sources", [])
             if message["role"] == "assistant" and sources:
+                show_progress_summary(
+                    message.get("progress_events", []),
+                    message.get("timings", {}),
+                )
                 preview_sources = message.get("preview_sources")
 
                 if preview_sources is None:
@@ -169,36 +278,73 @@ with chat_column:
 
         with st.chat_message("assistant"):
             try:
+                request_id = uuid4().hex[:8]
+                progress_events = []
                 request_start = perf_counter()
 
-                rag_prepare_start = perf_counter()
-                rag = get_rag()
-                rag_prepare_ms = elapsed_ms(rag_prepare_start)
+                with st.status(
+                    ":shimmer[正在准备问答……]",
+                    type="compact",
+                ) as status:
+                    rag, rag_prepare_ms = run_ui_stage(
+                        status,
+                        progress_events,
+                        request_id,
+                        "rag_prepare",
+                        "准备 RAG",
+                        get_rag,
+                    )
 
-                with st.spinner("正在检索资料并生成回答……"):
-                    result = rag.ask(question)
+                    result = rag.ask(
+                        question,
+                        progress=make_progress_reporter(status, progress_events),
+                        request_id=request_id,
+                    )
 
-                preview_start = perf_counter()
-                preview_sources = sources_with_file_content(result["sources"])
-                preview_prepare_ms = elapsed_ms(preview_start)
+                    preview_sources, preview_prepare_ms = run_ui_stage(
+                        status,
+                        progress_events,
+                        request_id,
+                        "preview_prepare",
+                        "准备引用文件",
+                        lambda: sources_with_file_content(result["sources"]),
+                    )
 
-                timings = result["timings"]
-                timings["rag_prepare_ms"] = rag_prepare_ms
-                timings["preview_prepare_ms"] = preview_prepare_ms
-                timings["total_ms"] = elapsed_ms(request_start)
+                    timings = result["timings"]
+                    timings["rag_prepare_ms"] = rag_prepare_ms
+                    timings["preview_prepare_ms"] = preview_prepare_ms
 
-                st.markdown(result["answer"])
+                    def save_assistant_message():
+                        message = {
+                            "role": "assistant",
+                            "content": result["answer"],
+                            "query": result["query"],
+                            "sources": result["sources"],
+                            "preview_sources": preview_sources,
+                            "timings": timings,
+                            "progress_events": progress_events,
+                            "request_id": request_id,
+                        }
+                        st.session_state.messages.append(message)
 
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": result["answer"],
-                        "query": result["query"],
-                        "sources": result["sources"],
-                        "preview_sources": preview_sources,
-                        "timings": timings,
-                    }
-                )
+                    _, page_finalize_ms = run_ui_stage(
+                        status,
+                        progress_events,
+                        request_id,
+                        "page_finalize",
+                        "完成页面数据",
+                        save_assistant_message,
+                    )
+                    timings["page_finalize_ms"] = page_finalize_ms
+                    timings["total_ms"] = elapsed_ms(request_start)
+                    logger.info(
+                        "request=%s state=complete total_ms=%.1f",
+                        request_id, timings["total_ms"],
+                    )
+                    status.update(
+                        label=f"回答完成 · {timings['total_ms'] / 1000:.2f} 秒",
+                        state="complete",
+                    )
 
                 st.rerun()
             except (ValueError, RuntimeError, OSError) as error:
