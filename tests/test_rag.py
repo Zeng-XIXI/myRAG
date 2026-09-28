@@ -87,6 +87,20 @@ class RAGTests(unittest.TestCase):
         ) if metadata["source"] == "notes.md"]
         self.assertEqual(notes, ["XYZ"])
 
+    def test_chunks_store_original_file_positions(self):
+        self.write_doc("notes.md", "\nalpha\nbeta\n")
+        self.rag.ingest()
+
+        records = self.collection().get(include=["documents", "metadatas"])
+        self.assertEqual(records["documents"], ["alpha\nbeta"])
+        self.assertEqual(
+            {
+                key: records["metadatas"][0][key]
+                for key in ("start_char", "end_char", "start_line", "end_line")
+            },
+            {"start_char": 1, "end_char": 11, "start_line": 2, "end_line": 3},
+        )
+
     def test_embedding_failure_preserves_previous_index(self):
         self.write_doc("notes.md", "原有资料")
         self.rag.ingest()
