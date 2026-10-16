@@ -103,6 +103,10 @@ def make_progress_reporter(status, events: list[dict]):
         elif state == "complete":
             duration = event["duration_ms"] or 0
             status.markdown(f":green[✓] {label} · {duration / 1000:.3f} 秒")
+            if detail := event.get("detail"):
+                status.caption(detail)
+            if content := event.get("content"):
+                status.caption(f"改写后的问题：{content}")
         else:
             status.update(label=f"{label}失败", state="error")
 
@@ -121,6 +125,10 @@ def show_progress_summary(events: list[dict], timings: dict):
         for event in completed_events:
             duration_ms = event.get("duration_ms", 0)
             st.markdown(f":green[✓] {event['label']} · {duration_ms / 1000:.3f} 秒")
+            if detail := event.get("detail"):
+                st.caption(detail)
+            if content := event.get("content"):
+                st.caption(f"改写后的问题：{content}")
 
 
 @st.cache_resource
@@ -187,7 +195,9 @@ def show_timings(timings: dict):
 
     labels = [
         ("RAG 准备", "rag_prepare_ms"),
+        ("问题路由", "route_ms"),
         ("索引检查", "index_check_ms"),
+        ("使用原问题", "direct_query_ms"),
         ("问题改写", "rewrite_ms"),
         ("Query Embedding", "embedding_ms"),
         ("向量检索", "vector_search_ms"),
@@ -240,21 +250,24 @@ with chat_column:
     for message_index, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             sources = message.get("sources", [])
-            if message["role"] == "assistant" and sources:
+            if message["role"] == "assistant":
                 show_progress_summary(
                     message.get("progress_events", []),
                     message.get("timings", {}),
                 )
-                preview_sources = message.get("preview_sources")
+                if sources:
+                    preview_sources = message.get("preview_sources")
 
-                if preview_sources is None:
-                    preview_sources = sources_with_file_content(sources)
+                    if preview_sources is None:
+                        preview_sources = sources_with_file_content(sources)
 
-                streamlit_citation_viewer(
-                    message["content"],
-                    preview_sources,
-                    key=f"assistant_message_{message_index}",
-                )
+                    streamlit_citation_viewer(
+                        message["content"],
+                        preview_sources,
+                        key=f"assistant_message_{message_index}",
+                    )
+                else:
+                    st.markdown(message["content"])
 
                 show_timings(message.get("timings", {}))
             else:
@@ -301,18 +314,21 @@ with chat_column:
                         request_id=request_id,
                     )
 
-                    preview_sources, preview_prepare_ms = run_ui_stage(
-                        status,
-                        progress_events,
-                        request_id,
-                        "preview_prepare",
-                        "准备引用文件",
-                        lambda: sources_with_file_content(result["sources"]),
-                    )
-
                     timings = result["timings"]
                     timings["rag_prepare_ms"] = rag_prepare_ms
-                    timings["preview_prepare_ms"] = preview_prepare_ms
+
+                    if result["sources"]:
+                        preview_sources, preview_prepare_ms = run_ui_stage(
+                            status,
+                            progress_events,
+                            request_id,
+                            "preview_prepare",
+                            "准备引用文件",
+                            lambda: sources_with_file_content(result["sources"]),
+                        )
+                        timings["preview_prepare_ms"] = preview_prepare_ms
+                    else:
+                        preview_sources = []
 
                     def save_assistant_message():
                         message = {
@@ -324,6 +340,8 @@ with chat_column:
                             "timings": timings,
                             "progress_events": progress_events,
                             "request_id": request_id,
+                            "route": result["route"],
+                            "route_reason": result["route_reason"],
                         }
                         st.session_state.messages.append(message)
 

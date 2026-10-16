@@ -13,6 +13,7 @@ from chromadb.errors import NotFoundError
 
 from config import Settings
 from models import Models
+from router import classify_question
 
 COLLECTION = "knowledge"
 logger = logging.getLogger("myrag.rag")
@@ -32,6 +33,7 @@ def _emit_progress(
     label: str,
     state: str,
     duration_ms: float | None = None,
+    details: dict | None = None,
 ):
     """记录阶段日志，并把同一事件交给可选的界面回调。"""
     if state == "complete":
@@ -46,13 +48,16 @@ def _emit_progress(
         )
 
     if progress is not None:
-        progress({
+        event = {
             "request_id": request_id,
             "stage": stage,
             "label": label,
             "state": state,
             "duration_ms": duration_ms,
-        })
+        }
+        if details:
+            event.update(details)
+        progress(event)
 
 
 @contextmanager
@@ -62,6 +67,7 @@ def _timed_stage(
     stage: str,
     label: str,
     progress: ProgressCallback | None,
+    completion_details: dict | None = None,
 ):
     """为一个同步阶段统一处理计时、进度事件和异常日志。"""
     _emit_progress(progress, request_id, stage, label, "start")
@@ -89,6 +95,7 @@ def _timed_stage(
         timings[f"{stage}_ms"] = duration
         _emit_progress(
             progress, request_id, stage, label, "complete", duration,
+            completion_details,
         )
 
 @dataclass(frozen=True)
@@ -374,20 +381,72 @@ class RAG:
         timings = {}
         rag_start = perf_counter()
 
+        route_details = {}
+
         with _timed_stage(
-            timings, request_id, "index_check", "检查知识库索引", progress,
+                timings,
+                request_id,
+                "route",
+                "判断问题类型",
+                progress,
+                route_details,
+        ):
+            decision = classify_question(question)
+            route_details["route"] = decision.route
+            route_details["detail"] = decision.reason
+
+        if decision.route in {"chat", "unclear"}:
+            timings["rag_total_ms"] = elapsed_ms(rag_start)
+
+            logger.info(
+                "request=%s phase=rag state=complete route=%s duration_ms=%.1f",
+                request_id,
+                decision.route,
+                timings["rag_total_ms"],
+            )
+
+            return {
+                "request_id": request_id,
+                "route": decision.route,
+                "route_reason": decision.reason,
+                "query": question,
+                "sources": [],
+                "answer": decision.answer,
+                "timings": timings,
+            }
+
+        with _timed_stage(
+                timings, request_id, "index_check", "检查知识库索引", progress,
         ):
             collection = self._collection()
 
-        with _timed_stage(
-            timings, request_id, "rewrite", "改写检索问题", progress,
-        ):
-            query = self.models.chat(
-                "你负责分析用户想查找什么资料。把问题改写成一句简洁的检索问题。"
-                "保留实体名、数字、时间、否定词和限制条件，不补充未知事实。"
-                "只输出检索问题，不回答问题，不输出解释。",
-                question,
-            )
+        if decision.rewrite:
+            rewrite_details = {}
+
+            with _timed_stage(
+                    timings,
+                    request_id,
+                    "rewrite",
+                    "改写检索问题",
+                    progress,
+                    rewrite_details,
+            ):
+                query = self.models.chat(
+                    "你负责分析用户想查找什么资料。把问题改写成一句简洁的检索问题。"
+                    "保留实体名、数字、时间、否定词和限制条件，不补充未知事实。"
+                    "只输出检索问题，不回答问题，不输出解释。",
+                    question,
+                )
+                rewrite_details["content"] = query
+        else:
+            with _timed_stage(
+                    timings,
+                    request_id,
+                    "direct_query",
+                    "使用原问题检索",
+                    progress,
+            ):
+                query = question
 
         sources = self._search(
             query,
@@ -423,6 +482,8 @@ class RAG:
 
         return {
             "request_id": request_id,
+            "route": decision.route,
+            "route_reason": decision.reason,
             "query": query,
             "sources": sources,
             "answer": answer,

@@ -141,7 +141,10 @@ class RAGTests(unittest.TestCase):
         self.write_doc("backup.md", "backup：在设置里点击导出备份。")
         self.write_doc("sharing.md", "共享：邀请其他用户加入。")
         self.rag.ingest()
-        original = "我想保留一份本地副本，但不要开启共享，怎么操作？"
+        original = (
+            "我想保留一份本地的数据副本，但是不希望开启共享功能，"
+            "请问应该进入哪个页面以及需要执行哪些具体操作？"
+        )
         self.models.chat.side_effect = ["backup", "在设置里点击导出备份。[1]"]
         events = []
 
@@ -159,7 +162,18 @@ class RAGTests(unittest.TestCase):
             event["stage"] for event in events
             if event["state"] == "complete"
         ]
+
+        self.assertEqual(result["route"], "rag")
+
+        route_event = next(
+            event for event in events
+            if event["stage"] == "route" and event["state"] == "complete"
+        )
+        self.assertEqual(route_event["route"], "rag")
+        self.assertIn("改写", route_event["detail"])
+
         self.assertEqual(completed_stages, [
+            "route",
             "index_check",
             "rewrite",
             "embedding",
@@ -167,6 +181,11 @@ class RAGTests(unittest.TestCase):
             "context_build",
             "answer_generation",
         ])
+        rewrite_event = next(
+            event for event in events
+            if event["stage"] == "rewrite" and event["state"] == "complete"
+        )
+        self.assertEqual(rewrite_event["content"], "backup")
         self.assertTrue(all(
             result["timings"][f"{stage}_ms"] >= 0
             for stage in completed_stages
@@ -201,7 +220,12 @@ class RAGTests(unittest.TestCase):
 
         self.assertEqual(
             [(event["stage"], event["state"]) for event in events],
-            [("index_check", "start"), ("index_check", "error")],
+            [
+                ("route", "start"),
+                ("route", "complete"),
+                ("index_check", "start"),
+                ("index_check", "error"),
+            ],
         )
         self.models.chat.assert_not_called()
         self.models.embed.assert_not_called()
@@ -213,7 +237,75 @@ class RAGTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "原索引未修改"):
             self.rag.ingest()
         self.assertEqual(self.collection().get()["documents"], ["原有资料"])
+    ## 新增“闲聊不调用 RAG”测试
+    def test_chat_route_skips_index_and_model_calls(self):
+        events = []
 
+        result = self.rag.ask(
+            "你好",
+            progress=events.append,
+            request_id="chat0001",
+        )
+
+        self.assertEqual(result["route"], "chat")
+        self.assertEqual(result["query"], "你好")
+        self.assertEqual(result["sources"], [])
+        self.assertIn("你好", result["answer"])
+
+        self.models.chat.assert_not_called()
+        self.models.embed.assert_not_called()
+
+        self.assertEqual(
+            [(event["stage"], event["state"]) for event in events],
+            [
+                ("route", "start"),
+                ("route", "complete"),
+            ],
+        )
+
+    ## 新增“明确问题跳过改写”测试
+    def test_clear_question_uses_original_query_without_rewrite(self):
+        self.write_doc("backup.md", "如何备份：在设置里点击导出备份。")
+        self.rag.ingest()
+
+        # 清除入库阶段产生的模型调用记录，只统计后面的问答流程。
+        self.models.chat.reset_mock()
+        self.models.embed.reset_mock()
+        self.models.chat.return_value = "在设置里点击导出备份。[1]"
+
+        events = []
+
+        result = self.rag.ask(
+            "如何备份？",
+            progress=events.append,
+            request_id="direct01",
+        )
+
+        self.assertEqual(result["route"], "rag")
+        self.assertEqual(result["query"], "如何备份？")
+        self.assertEqual(result["answer"], "在设置里点击导出备份。[1]")
+
+        completed_stages = [
+            event["stage"]
+            for event in events
+            if event["state"] == "complete"
+        ]
+        self.assertEqual(
+            completed_stages,
+            [
+                "route",
+                "index_check",
+                "direct_query",
+                "embedding",
+                "vector_search",
+                "context_build",
+                "answer_generation",
+            ],
+        )
+
+        # 只调用一次聊天模型来生成答案，没有额外调用模型改写问题。
+        self.models.chat.assert_called_once()
+        self.models.embed.assert_called_once_with(["如何备份？"])
 
 class TextAndModelTests(unittest.TestCase):
     def test_chunk_boundaries_do_not_create_redundant_tail(self):

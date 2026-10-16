@@ -17,6 +17,10 @@ class SDKIntegrationTests(unittest.TestCase):
     def test_ingest_and_ask_with_separate_model_services(self):
         requests = []
         replies = iter(["  backup  ", "  在设置中导出备份。[1]  "])
+        question = (
+            "我想保留一份本地的数据副本，但是不希望开启共享功能，"
+            "请问应该进入哪个页面以及需要执行哪些具体操作？"
+        )
 
         def handle(request):
             self.assertEqual(request.method, "POST")
@@ -77,16 +81,17 @@ class SDKIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     (ingest_result.added_files, ingest_result.total_chunks), (2, 2)
                 )
-                result = rag.ask("如何备份？")
+                result = rag.ask(question)
 
         self.assertEqual([path for path, _ in requests], [
             "/v1/embeddings", "/v1/chat/completions",
             "/v1/embeddings", "/v1/chat/completions",
         ])
-        self.assertEqual(requests[1][1]["messages"][1]["content"], "如何备份？")
+        self.assertEqual(requests[1][1]["messages"][1]["content"], question)
         self.assertEqual(requests[2][1]["input"], ["backup"])
         self.assertIn("backup.md", requests[3][1]["messages"][1]["content"])
         self.assertEqual(result["query"], "backup")
+        self.assertEqual(result["route"], "rag")
         self.assertEqual(result["answer"], "在设置中导出备份。[1]")
         self.assertEqual(result["sources"][0]["source"], "backup.md")
 
